@@ -68,8 +68,9 @@ proto = {
     'DATA':            [13, 'Data ',                        'DATA'],
     'CMD_WARNINGS':    [14, 'Command Warnings',         'CMD_WARN'],
     'BIC':             [15, 'Bus Idle Condition ',           'BIC'],
-    'SSC_WARNINGS':    [16, 'SSC Warnings',             'SCC_WARN'],
+    'BC_WARNINGS':     [16, 'BC Warnings',               'BC_WARN'],
     'IJE':             [17, 'Illegal Jump Edge',        'IJE_WAEN'],
+    'PW':              [18, 'Parity warnings',            'P_WAEN'],
 }
 
 class Decoder(srd.Decoder):
@@ -87,8 +88,8 @@ class Decoder(srd.Decoder):
         {'id': 'sdata', 'type': 108, 'name': 'SDATA', 'desc': 'Serial data line'},
     )
     options = (
-        {'id': 'address_format', 'desc': 'Displayed slave address format',
-            'default': 'shifted', 'values': ('shifted', 'unshifted')},
+        {'id': 'error_display', 'desc': 'Error display options',
+            'default': 'display', 'values': ('display', 'not_display')},
     )
     annotations = (
         ('7', 'ssc', 'Sequence Start Condition'),
@@ -101,18 +102,19 @@ class Decoder(srd.Decoder):
         ('110', 'rr', 'Register read'),
         ('109', 'r0w', 'Register 0 write'),
         ('108', 'bc', 'Byte'),
-        ('80', 'p', 'Parity'),
+        ('7', 'p', 'Parity'),
         ('75', 'address', 'Address'),
         ('70', 'bp', 'Bus pack'),
         ('65', 'data', 'DATA'),
         ('1000', 'Command warnings', 'Command warnings'),
         ('50', 'Bus Idle Condition ', 'Bus Idle Condition '),
-        ('1000', 'SSC warnings', 'SSC warnings'),
+        ('1000', 'BC warnings', 'BC warnings'),
         ('1000', 'Illegal Jump Edge', 'IJE_WAEN'),
+        ('1000', 'Parity warnings', 'Parity warnings'),
     )
     annotation_rows = (
         ('command-data', 'Command/Data', (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 , 11, 12, 13 ,15)),
-        ('warnings', 'Warnings', (14,16,17,)),
+        ('warnings', 'Warnings', (14,16,17,18,)),
     )
 
     def __init__(self):
@@ -123,16 +125,20 @@ class Decoder(srd.Decoder):
         self.ss = self.es = -1
         self.bitcount = 0
         self.databyte = 0
-        self.state = 'FIND BUS_PARK'
+        self.state = 'FIND SSC'
         self.extended = -1
         self.cmdkey = 'NULL'
         self.BC = 0
+        self.bits = 0
         self.Pcount = 0
         self.BPcount = 0
         self.ADDcount = 0
         self.BPss = 0
         self.SSCs = 0
         self.Pes = 0
+        self.sdata = -1
+        self.Pdata = -1
+        self.parity = False
 
     def metadata(self, key, value):
         if key == srd.SRD_CONF_SAMPLERATE:
@@ -140,10 +146,34 @@ class Decoder(srd.Decoder):
 
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
+        self._display = 1 if self.options['error_display'] == 'display' else 0
 
     def putx(self, data):
         self.put(self.ss, self.es, self.out_ann, data)
-    
+
+    def Parity(self):
+        self.parity = True
+        if self.Pcount == 1 :
+            if self.cmdkey == 'ERW' :
+                self.Pdata = self.Pdata + (0*(2**(self.Pkey+1)))
+            if self.cmdkey == 'ERR' :
+                self.Pdata = self.Pdata + (2*(2**(self.Pkey+1)))
+            if self.cmdkey == 'ERWL' :
+                self.Pdata = self.Pdata + (6*(2**(self.Pkey+1)))
+            if self.cmdkey == 'ERRL' :
+                self.Pdata = self.Pdata + (7*(2**(self.Pkey+1)))                 
+            if self.cmdkey == 'RW' :
+                self.Pdata = self.Pdata + (2*(2**(self.Pkey+1)))                 
+            if self.cmdkey == 'RR' :
+                self.Pdata = self.Pdata + (3*(2**(self.Pkey+1)))                 
+            if self.cmdkey == 'R0W' :
+                self.Pdata = self.Pdata + (1*(2**(self.Pkey+1))) 
+        while self.Pdata :
+            self.parity = not self.parity
+            self.Pdata = self.Pdata & (self.Pdata - 1)
+        self.Pdata = self.Pkey = 0
+                
+            
     def handle_BP(self,cmd,state):
 
         self.ss = self.Pes
@@ -151,135 +181,176 @@ class Decoder(srd.Decoder):
         self.putx([proto[cmd][0], proto[cmd][1:]])
         self.state = state
 
-    def handle(self,sclk,sdata,cmd,state,key):
-        
-        self.databyte <<= 1
-        self.databyte |= sdata
-
+    def handle(self,cmd,state,key,key0):
+        key1 = key
+        if key > 7 :
+            key = 7
         if self.bitcount == 0:
             self.DATAss = self.samplenum
         
         if self.bitcount < key:
             while True :
-                self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
-                if (self.matched & (0b1 << 0)):
-                    self.ss = self.samplenum
-                    self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
+                if self._display :
+                    (sclk, sdata) = self.wait([{0: 'f'},{0: 'l', 1: 'e'}])
                     if (self.matched & (0b1 << 0)):
-                        self.es = self.samplenum
-                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                    if (self.matched & (0b1 << 1)):
-                        self.es = self.samplenum
-                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
+                        self.databyte <<= 1
+                        self.databyte |= sdata
                         break
-                if (self.matched & (0b1 << 1)):
+                    if (self.matched & (0b1 << 1)):
+                        self.ss = self.samplenum
+                        (sclk, sdata) = self.wait([{0: 'f'},{0: 'l', 1: 'e'}])
+                        if (self.matched & (0b1 << 0)):
+                            self.es = self.samplenum
+                            self.putx([proto['IJE'][0], proto['IJE'][1:]])
+                            self.databyte <<= 1
+                            self.databyte |= sdata
+                            break
+                        if (self.matched & (0b1 << 1)):
+                            self.es = self.samplenum                        
+                            self.putx([proto['IJE'][0], proto['IJE'][1:]])
+                else :
+                    (sclk, sdata) = self.wait({0: 'f'})
+                    self.databyte <<= 1
+                    self.databyte |= sdata
                     break
+
             self.bitcount += 1
             return
         
-        d = self.databyte
-        
         while True :
-            self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
-            if (self.matched & (0b1 << 0)):
-                self.ss = self.samplenum
-                self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
+            if self._display :
+                (sclk, sdata) = self.wait([{0: 'f'},{0: 'l', 1: 'e'}])
                 if (self.matched & (0b1 << 0)):
-                    self.es = self.samplenum
-                    self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                if (self.matched & (0b1 << 1)):
-                    self.es = self.samplenum
-                    self.putx([proto['IJE'][0], proto['IJE'][1:]])
+                    self.databyte <<= 1
+                    self.databyte |= sdata
                     break
-            if (self.matched & (0b1 << 1)):
+                if (self.matched & (0b1 << 1)):
+                    self.ss = self.samplenum
+                    (sclk, sdata) = self.wait([{0: 'f'},{0: 'l', 1: 'e'}])
+                    if (self.matched & (0b1 << 0)):
+                        self.es = self.samplenum
+                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
+                        self.databyte <<= 1
+                        self.databyte |= sdata
+                        break
+                    if (self.matched & (0b1 << 1)):
+                        self.es = self.samplenum                        
+                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
+            else :
+                (sclk, sdata) = self.wait({0: 'f'})
+                self.databyte <<= 1
+                self.databyte |= sdata
                 break
+        self.wait({0 : 'r'})
+        d = self.databyte
         self.ss = self.DATAss
         self.es = self.samplenum
+        if cmd != 'P':
+            self.Pdata = d
+            self.Pkey = key
+        if cmd == 'BC':
+            self.BC = d
+            if self.cmdkey == 'ERW' or self.cmdkey == 'ERR' :
+                if self.BC < 4 or self.BC > 16 :
+                    self.putx([proto['BC_WARNINGS'][0], proto['BC_WARNINGS'][1:]])
+                    self.init()
+                    return 
+            else :
+                if self.BC < 1 or self.BC > 8 :
+                    self.putx([proto['BC_WARNINGS'][0], proto['BC_WARNINGS'][1:]])
+                    self.init()
+                    return
         if cmd == 'P':
             self.Pes = self.samplenum
-        self.putx([proto[cmd][0], ['%s[%d:0]: %02X' % (proto[cmd][1],key,d),
-                   '%s[%d:0]: %02X' % (proto[cmd][2],key,d), '%02X' % d]])
+            if self._display :
+                self.Parity()
+                if self.parity != d :
+                    self.putx([proto['PW'][0], proto['PW'][1:]]) 
+            self.putx([proto[cmd][0], ['%s: %d' % (proto[cmd][1],d),
+                '%s: %d' % (proto[cmd][2],d), '%d' % d]])     
+            self.bitcount = self.databyte = 0
+            self.state = state
+            return
+        self.putx([proto[cmd][0], ['%s[%d:%d]: %02X' % (proto[cmd][1],key1,key0,d),
+                   '%s[%d:%d]: %02X' % (proto[cmd][2],key1,key0,d), '%02X' % d]])
         self.bitcount = self.databyte = 0
+        if cmd == 'DATA':
+            self.bits -= 8
         self.state = state
-
-    def handle_CMD(self,sclk,sdata):
         
+
+        
+
+    def handle_CMD(self):       
         if self.bitcount == 0:
             self.DATAss = self.samplenum
+            (sclk, sdata) = self.wait({0: 'f'})
             if sdata :
+                self.wait({0 : 'r'})
                 self.cmdset('R0W','FIND DATA')
                 return
 
-        if self.bitcount == 1:
-            if sdata :
+        if self.bitcount == 1:            
+            if self.sdata :
                 self.extended = 0
             else :
                 self.extended = 1    
 
-        if self.bitcount == 2:
-            if ~self.extended :
-                if sdata :
+        if self.bitcount == 2:        
+            if not self.extended :
+                if self.sdata :                
                     self.cmdset('RR','FIND ADDRESS')
                     return
-                else :
+                else :               
                     self.cmdset('RW','FIND ADDRESS')
                     return
             
-        if self.bitcount == 3:
-            if ~sdata :
-                if self.extended :
+        if self.bitcount == 3:         
+            if not self.sdata :
+                if self.extended :               
                     self.cmdset('ERR','FIND BTEY_COUNT')
                     return
-                else :
+                else :                
                     self.cmdset('ERW','FIND BTEY_COUNT')
                     return
-            elif self.extended :
+            elif self.extended :  
+                self.ss = self.DATAss            
                 self.es = self.samplenum
                 self.putx([proto['CMD_WARNINGS'][0], proto['CMD_WARNINGS'][1:]])
                 self.init()
                 return
 
-        if self.bitcount == 4:
-            if sdata :
+        if self.bitcount == 4:          
+            if self.sdata :              
                 self.cmdset('ERRL','FIND BTEY_COUNT')
                 return
-            else :
+            else :                
                 self.cmdset('ERWL','FIND BTEY_COUNT')
                 return
 
         if self.bitcount <4:
             while True :
-                (sclk, sdata) = self.wait([{0: 'l', 1: 'e'},{0: 'h'}])
-                if (self.matched & (0b1 << 0)):
-                    self.ss = self.samplenum
-                    (sclk, sdata) = self.wait([{0: 'l', 1: 'e'},{0: 'h'}])
+                if self._display :
+                    (sclk,self.sdata) = self.wait([{0: 'f'},{0: 'l', 1: 'e'}])
                     if (self.matched & (0b1 << 0)):
-                        self.es = self.samplenum
-                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                    if (self.matched & (0b1 << 1)):
-                        self.es = self.samplenum
-                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
                         break
-                if (self.matched & (0b1 << 1)):
+                    if (self.matched & (0b1 << 1)):
+                        self.ss = self.samplenum
+                        (sclk,self.sdata) = self.wait([{0: 'f'},{0: 'l', 1: 'e'}])
+                        if (self.matched & (0b1 << 0)):
+                            self.es = self.samplenum
+                            self.putx([proto['IJE'][0], proto['IJE'][1:]])
+                            break
+                        if (self.matched & (0b1 << 1)):
+                            self.es = self.samplenum
+                            self.putx([proto['IJE'][0], proto['IJE'][1:]])
+                else :
+                    (sclk,self.sdata) = self.wait({0: 'f'})
                     break
+            self.wait({0 : 'r'})
             self.bitcount += 1
 
     def cmdset(self,cmd,state):
-        while True :
-            self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
-            if (self.matched & (0b1 << 0)):
-                self.ss = self.samplenum
-                self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
-                if (self.matched & (0b1 << 0)):
-                    self.es = self.samplenum
-                    self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                if (self.matched & (0b1 << 1)):
-                    self.es = self.samplenum
-                    self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                    break
-            if (self.matched & (0b1 << 1)):
-                break
-
         self.ss = self.DATAss
         self.es = self.samplenum
         self.putx([proto[cmd][0], proto[cmd][1:]])
@@ -302,74 +373,63 @@ class Decoder(srd.Decoder):
         self.BC = 0
         self.bitcount = 0
         self.Pes = 0
-        if self.state == 'FIND COMMAND':
-            self.state = 'FIND BUS_PARK'
-        else:
-            self.state = 'FIND SSC'
+        self.state = 'FIND SSC'
+
+
+        
 
     def decode(self):
         while True:
-            if self.state == 'FIND SSC':       
+            if self.state == 'FIND SSC':
+                self.wait({0: 'l', 1: 'r'})
+                self.BPss = self.samplenum   
                 self.wait([{0: 'h'},{0: 'l', 1: 'f'}])
                 if (self.matched & (0b1 << 0)):
-                    self.ss = self.es = self.samplenum
-                    self.putx([proto['SSC_WARNINGS'][0], proto['SSC_WARNINGS'][1:]])
-                    self.state = 'FIND BUS_PARK'
+                    continue
                 if (self.matched & (0b1 << 1)):
                     self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
                     if (self.matched & (0b1 << 0)):
-                        self.ss = self.samplenum
-                        self.wait([{0: 'l', 1: 'e'},{0: 'r'}])
-                        if (self.matched & (0b1 << 0)):
-                            self.es = self.samplenum
-                            self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                        if (self.matched & (0b1 << 1)):
-                            self.es = self.samplenum
-                            self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                            self.ss,self.es = self.BPss,self.samplenum
-                            self.putx([proto['SSC'][0], proto['SSC'][1:]])
-                            self.state = 'FIND SLAVE ADDRESS'
-                            continue
+                        continue
                     if (self.matched & (0b1 << 1)):
                         self.ss,self.es = self.BPss,self.samplenum
                         self.putx([proto['SSC'][0], proto['SSC'][1:]])
                         self.state = 'FIND SLAVE ADDRESS'
                     
             elif self.state == 'FIND SLAVE ADDRESS':
-                (sclk, sdata) = self.wait({0: 'h'})
-                self.handle(sclk,sdata,'SA','FIND COMMAND',3)
+                self.handle('SA','FIND COMMAND',3,0)
             
             elif self.state == 'FIND COMMAND':
-                (sclk, sdata) = self.wait({0: 'h'})
-                self.handle_CMD(sclk,sdata)
+                self.handle_CMD()
                 
             elif  self.state == 'FIND BTEY_COUNT':
-                (sclk, sdata) = self.wait({0: 'h'})
                 if self.cmdkey == 'ERW' or self.cmdkey == 'ERR' :                   
-                    self.handle(sclk,sdata,'BC','FIND PARITY',3)
+                    self.handle('BC','FIND PARITY',3,0)
                 else :                   
-                    self.handle(sclk,sdata,'BC','FIND PARITY',2)
+                    self.handle('BC','FIND PARITY',2,0)
+                self.bits = self.BC*8
 
             elif self.state == 'FIND ADDRESS':
-                (sclk, sdata) = self.wait({0: 'h'})
                 if self.cmdkey == 'RW' or self.cmdkey == 'RR' :                  
-                    self.handle(sclk,sdata,'ADDRESS','FIND PARITY',4)
-                else :                   
-                    self.handle(sclk,sdata,'ADDRESS','FIND PARITY',7)
+                    self.handle('ADDRESS','FIND PARITY',4,0)
+                elif self.cmdkey == 'ERR' or self.cmdkey == 'ERW' : 
+                    self.handle('ADDRESS','FIND PARITY',7,0)
+                else : 
+                    if self.Pcount == 1  :                
+                        self.handle('ADDRESS','FIND PARITY',15,8)
+                    else :
+                        self.handle('ADDRESS','FIND PARITY',7,0)
 
             elif self.state == 'FIND DATA':
-                (sclk, sdata) = self.wait({0: 'h'})
                 if self.cmdkey == 'R0W' :                   
-                    self.handle(sclk,sdata,'DATA','FIND PARITY',6)
+                    self.handle('DATA','FIND PARITY',6,0)
                 elif self.cmdkey == 'RW' or self.cmdkey == 'RR' :                  
-                    self.handle(sclk,sdata,'DATA','FIND PARITY',7)
+                    self.handle('DATA','FIND PARITY',7,0)
                 else :                   
-                    self.handle(sclk,sdata,'DATA','FIND PARITY',(self.BC*8-1))
+                    self.handle('DATA','FIND PARITY',self.bits-1,self.bits-8)
 
             elif self.state == 'FIND PARITY':
-                (sclk, sdata) = self.wait({0: 'h'})
                 self.Pcount += 1
-                self.handle(sclk,sdata,'P','NULL',0)
+                self.handle('P','NULL',0,0)
                 if self.cmdkey == 'R0W' :
                     self.state = 'FIND BUS_PARK'
 
@@ -378,12 +438,23 @@ class Decoder(srd.Decoder):
                         self.ADDcount,self.state = 1,'FIND ADDRESS'  
                     elif self.Pcount == 2 :
                         self.state = 'FIND DATA'
+                    elif self.Pcount == self.BC + 2 :
+                        self.state = 'FIND BUS_PARK'
+                        continue
+                    elif self.Pcount > 2 :
+                        self.state = 'FIND DATA'
 
                 elif self.cmdkey == 'ERR' :
                     if self.Pcount == 1 :
                         self.ADDcount,self.state = 1,'FIND ADDRESS' 
                     elif self.Pcount == 2 :
                         self.BPcount,self.state = 1,'FIND BUS_PARK'
+                    elif self.Pcount == self.BC + 2 :
+                        self.BPcount =2
+                        self.state = 'FIND BUS_PARK'
+                        continue
+                    elif self.Pcount > 2 :
+                        self.state = 'FIND DATA'
 
                 elif self.cmdkey == 'ERWL' :
                     if self.Pcount == 1 :
@@ -391,6 +462,11 @@ class Decoder(srd.Decoder):
                     elif self.Pcount == 2 :    
                         self.ADDcount,self.state = 1,'FIND ADDRESS' 
                     elif self.Pcount == 3 :
+                        self.state = 'FIND DATA'
+                    elif self.Pcount == self.BC + 3 :
+                        self.state = 'FIND BUS_PARK'
+                        continue
+                    elif self.Pcount > 3 :
                         self.state = 'FIND DATA'
                     
                 elif self.cmdkey == 'ERRL' :
@@ -400,6 +476,12 @@ class Decoder(srd.Decoder):
                         self.ADDcount,self.state = 1,'FIND ADDRESS'
                     elif self.Pcount == 3 :
                         self.BPcount,self.state = 1,'FIND BUS_PARK'
+                    elif self.Pcount == self.BC + 3 :
+                        self.BPcount =2
+                        self.state = 'FIND BUS_PARK'
+                        continue
+                    elif self.Pcount > 3 :
+                        self.state = 'FIND DATA'
 
                 elif self.cmdkey == 'RW' :
                     if self.Pcount == 1 :    
@@ -412,45 +494,17 @@ class Decoder(srd.Decoder):
                     self.BPcount = 1 if (self.Pcount == 1) else 2 
 
             elif self.state == 'FIND BUS_PARK':
-                (sclk, sdata) = self.wait([{0: 'l', 1: 'r'},{0: 'l', 1: 'l'}])
-                if (self.matched & (0b1 << 0)):
-                    self.ss = self.samplenum
-                    self.wait([{0: 'l', 1: 'e'},{0: 'l', 1: 'l'}])
-                    if (self.matched & (0b1 << 0)):
-                        self.es = self.samplenum
-                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                    if (self.matched & (0b1 << 1)):
-                        self.es = self.samplenum
-                        self.putx([proto['IJE'][0], proto['IJE'][1:]])
-                if (self.matched & (0b1 << 1)):
-                    self.BPss = self.samplenum
-                    if self.cmdkey == 'NULL':
-                        self.wait([{0 : 'r', 1 : 'l'},{0: 'l', 1: 'r'}])
-                        if (self.matched & (0b1 << 0)):
-                            self.ss = self.samplenum
-                            self.wait([{0 : 'r', 1 : 'l'},{0: 'f', 1: 'l'},{0: 'l', 1: 'r'}])
-                            if (self.matched & (0b1 << 0)):
-                                self.es =self.samplenum
-                                self.putx([proto['SSC_WARNINGS'][0], proto['SSC_WARNINGS'][1:]])
-                                self.state ='FIND BUS_PARK'
-                            if (self.matched & (0b1 << 1)):
-                                self.BPss = self.samplenum
-                            if (self.matched & (0b1 << 2)):
-                                self.state ='FIND SSC' 
-                                continue
-                        if (self.matched & (0b1 << 1)):
-                            # self.SSCs = self.samplenum
-                            self.state ='FIND SSC'   
-
-                    elif self.cmdkey == 'ERR' or self.cmdkey == 'ERRL' or self.cmdkey == 'RR':
-                        key = 0 if (self.BPcount == 1) else 1 
-                        self.initBP(sclk,sdata,'FIND DATA',key)
-                    else :
-                        self.initBP(sclk,sdata,'FIND SSC',1)
+                (sclk, sdata) = self.wait({0: 'l', 1: 'l'})
+                self.ss = self.samplenum   
+                if self.cmdkey == 'ERR' or self.cmdkey == 'ERRL' or self.cmdkey == 'RR':
+                    key = 0 if (self.BPcount == 1) else 1 
+                    self.initBP(sclk,sdata,'FIND DATA',key)
+                else :
+                    self.initBP(sclk,sdata,'FIND SSC',1)
 
             
 
 
                 
-                
+            
         
